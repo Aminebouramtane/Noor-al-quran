@@ -54,6 +54,19 @@ export const api = {
     return response.json();
   },
 
+  async matchRecitedAyah(transcript: string, topK: number = 3) {
+    const response = await fetch(`${API_BASE_URL}/api/nlp/match-ayah`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ transcript, top_k: topK }),
+    });
+
+    if (!response.ok) throw new Error('Failed to match recited ayah');
+    return response.json();
+  },
+
   async uploadAudio(file: File) {
     const formData = new FormData();
     formData.append('file', file);

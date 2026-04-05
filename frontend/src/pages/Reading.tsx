@@ -21,6 +21,7 @@ type QuranAyah = {
   ayah_no_quran: number;
   ayah_ar: string;
   ayah_en: string;
+  tafsir?: string | null;
 };
 
 type QuranSurah = {
@@ -87,14 +88,6 @@ export default function Reading() {
   const totalAyahs = surah?.ayahs.length ?? 0;
   const currentAyah = surah?.ayahs.find((ayah) => ayah.ayah_no_surah === activeAyah) ?? surah?.ayahs[0] ?? null;
   const isReadingPage = Boolean(currentSurahNo);
-
-  useEffect(() => {
-    if (!surah || !currentAyah) return;
-    const target = ayahRefs.current[currentAyah.ayah_no_surah];
-    if (target) {
-      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  }, [currentAyah?.ayah_no_surah, surah]);
 
   useEffect(() => {
     if (!surah || !currentSurahNo) return;
@@ -273,8 +266,13 @@ export default function Reading() {
                       ref={(node) => {
                         ayahRefs.current[ayah.ayah_no_surah] = node;
                       }}
-                      onClick={() => setActiveAyah(ayah.ayah_no_surah)}
-                      className={`cursor-pointer rounded-3xl p-5 md:p-7 border shadow-sm transition-all ${
+                      onClick={() => {
+                        setActiveAyah(ayah.ayah_no_surah);
+                      }}
+                      tabIndex={0}
+                      role="button"
+                      aria-label={`عرض تفسير الآية ${ayah.ayah_no_surah}`}
+                      className={`cursor-pointer rounded-3xl p-5 md:p-7 border shadow-sm transition-all outline-none ${
                         activeAyah === ayah.ayah_no_surah
                           ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20 shadow-md'
                           : 'bg-surface-container-lowest/95 border-outline-variant/20 hover:border-primary/20 hover:shadow-md'
@@ -294,6 +292,17 @@ export default function Reading() {
                       <div className="rounded-2xl bg-surface-container-lowest/60 border border-outline-variant/10 p-4">
                         <p className="text-sm md:text-base text-on-surface-variant leading-7">{ayah.ayah_en}</p>
                       </div>
+                      {activeAyah === ayah.ayah_no_surah && ayah.tafsir && (
+                        <div className="mt-4 rounded-2xl bg-secondary-container/20 border border-secondary/10 p-4">
+                          <div className="flex items-center justify-between gap-3 mb-2">
+                            <p className="text-xs font-bold text-secondary">التفسير</p>
+                            <span className="text-xs text-on-surface-variant">
+                              آية {arabicNumber(ayah.ayah_no_surah)}
+                            </span>
+                          </div>
+                          <p className="text-sm md:text-base text-on-surface leading-8">{ayah.tafsir}</p>
+                        </div>
+                      )}
                     </motion.article>
                   ))}
                 </div>

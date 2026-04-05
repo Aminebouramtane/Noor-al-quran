@@ -23,6 +23,7 @@ type QuranAyah = {
   ayah_no_quran: number;
   ayah_ar: string;
   ayah_en: string;
+  tafsir?: string | null;
 };
 
 type QuranSurah = {
@@ -57,6 +58,21 @@ type SpeechRecognitionCtor = new () => {
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
+};
+
+type NlpAyahMatch = {
+  rank: number;
+  score: number;
+  distance: number;
+  surah_no: number;
+  surah_name_ar: string;
+  ayah_no_surah: number;
+  ayah_no_quran: number;
+  ayah_ar: string;
+  ayah_en: string;
+  tafsir?: string | null;
+  target_id: string;
+  target_label: string;
 };
 
 const COMPLETION_STORAGE_KEY = 'noor:surahCompletions';
@@ -100,6 +116,7 @@ export default function NlpRecitation() {
 
   const recognitionRef = useRef<InstanceType<SpeechRecognitionCtor> | null>(null);
   const heartSvgRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef('');
 
   const [surahs, setSurahs] = useState<SurahSummary[]>([]);
   const [selectedSurahNo, setSelectedSurahNo] = useState<number | null>(surahNo ? Number(surahNo) : null);
@@ -110,6 +127,8 @@ export default function NlpRecitation() {
   const [isListening, setIsListening] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelMatches, setModelMatches] = useState<NlpAyahMatch[]>([]);
   const [completions, setCompletions] = useState<Record<string, SurahCompletion>>({});
 
   const completionItems = useMemo(() => Object.values(completions) as SurahCompletion[], [completions]);
@@ -366,6 +385,36 @@ export default function NlpRecitation() {
     }
   }, [completedSurahNameSet]);
 
+  const analyzeRecitationWithModel = async (transcript: string) => {
+    const clean = transcript.trim();
+    if (!clean) {
+      setModelMatches([]);
+      return;
+    }
+
+    try {
+      setModelLoading(true);
+      const result = await api.matchRecitedAyah(clean, 3);
+      const matches = (result?.matches || []) as NlpAyahMatch[];
+      setModelMatches(matches);
+
+      if (matches.length > 0) {
+        const top = matches[0];
+        if (selectedSurahNo !== top.surah_no) {
+          setSelectedSurahNo(top.surah_no);
+          navigate(`/nlp-reading/${top.surah_no}`);
+        }
+        if (top.ayah_no_surah > 0) {
+          setActiveAyahNo(top.ayah_no_surah);
+        }
+      }
+    } catch {
+      setError('تعذر تحليل التلاوة بالنموذج حالياً.');
+    } finally {
+      setModelLoading(false);
+    }
+  };
+
   const startListening = () => {
     setError('');
 
@@ -390,6 +439,7 @@ export default function NlpRecitation() {
         .join(' ')
         .trim();
       setRecognizedText(transcript);
+      transcriptRef.current = transcript;
     };
 
     recognition.onerror = () => {
@@ -399,6 +449,10 @@ export default function NlpRecitation() {
 
     recognition.onend = () => {
       setIsListening(false);
+      const finalTranscript = transcriptRef.current.trim();
+      if (finalTranscript) {
+        void analyzeRecitationWithModel(finalTranscript);
+      }
     };
 
     recognitionRef.current = recognition;
@@ -487,6 +541,8 @@ export default function NlpRecitation() {
     setActiveAyahNo(1);
     setRecognizedText('');
     setTotalMistakes(0);
+    setModelMatches([]);
+    transcriptRef.current = '';
     setError('');
   };
 
@@ -552,6 +608,13 @@ export default function NlpRecitation() {
                   <p className="font-quran text-2xl leading-[2.2]">{currentAyah.ayah_ar}</p>
                 </div>
 
+                {currentAyah.tafsir && (
+                  <div className="rounded-2xl border border-secondary/15 bg-secondary-container/20 p-4 mb-4">
+                    <p className="text-xs text-secondary font-bold mb-2">التفسير</p>
+                    <p className="text-sm leading-8 text-on-surface">{currentAyah.tafsir}</p>
+                  </div>
+                )}
+
                 <div className="rounded-2xl border border-outline-variant/15 bg-surface p-4 min-h-28">
                   <p className="text-xs text-on-surface-variant mb-2">النص المتعرف عليه</p>
 
@@ -575,6 +638,30 @@ export default function NlpRecitation() {
                   <div className="rounded-xl bg-surface-container-low p-3 border border-outline-variant/10">
                     أخطاء الآية: {arabicNumber(comparison.mistakes)}
                   </div>
+                </div>
+
+                <div className="mt-4 rounded-2xl border border-primary/15 bg-primary/5 p-4">
+                  <p className="text-xs text-on-surface-variant mb-2">تحليل النموذج (NLP)</p>
+                  {modelLoading ? (
+                    <p className="text-sm text-on-surface-variant">جاري تحليل التلاوة...</p>
+                  ) : modelMatches.length > 0 ? (
+                    <div className="space-y-2">
+                      {modelMatches.map((match) => (
+                        <div key={`${match.target_id}-${match.rank}`} className="rounded-xl bg-surface-container-lowest border border-outline-variant/20 p-3">
+                          <div className="flex items-center justify-between gap-3 text-sm">
+                            <span className="font-bold">#{match.rank} {match.surah_name_ar} - آية {arabicNumber(match.ayah_no_surah)}</span>
+                            <span className="text-on-surface-variant">ثقة: {(match.score * 100).toFixed(1)}%</span>
+                          </div>
+                          <p className="mt-1 font-quran text-lg leading-8">{match.ayah_ar}</p>
+                          {match.tafsir && (
+                            <p className="mt-2 text-xs text-on-surface-variant leading-6">{match.tafsir.slice(0, 220)}...</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-on-surface-variant">افتح الميكروفون واقرأ، وسيعرض النموذج أقرب آية تلقائياً.</p>
+                  )}
                 </div>
 
                 <div className="mt-5 flex flex-wrap items-center gap-3">

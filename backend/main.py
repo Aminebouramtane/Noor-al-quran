@@ -6,12 +6,16 @@ from pydantic import BaseModel
 import pandas as pd
 import os
 from typing import Optional, List
+import joblib
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
 import subprocess
+import re
 from pathlib import Path
 from mimetypes import guess_type
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from google.cloud import storage as gcs_storage
@@ -47,12 +51,15 @@ FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 LOCAL_DATASET_DIR = os.getenv("LOCAL_DATASET_DIR", "./data/dataset")
 LOCAL_DATASET_METADATA_PATH = os.getenv("DATASET_PATH", "./data/dataset/metadata.csv")
 QURAN_DATASET_PATH = os.getenv("QURAN_DATASET_PATH", "./data/The Quran Dataset.csv")
+QURAN_TAFSIR_DATASET_PATH = os.getenv("QURAN_TAFSIR_DATASET_PATH", "./data/Quran with tafsir.csv")
+RECITATION_MODEL_PATH = os.getenv("RECITATION_MODEL_PATH", "./models/recitation_retrieval_model.joblib")
 
 firebase_enabled = False
 db = None
 bucket = None
 gcs_client = None
 df_quran = None
+recitation_model_bundle = None
 
 # Arabic to English lesson name mapping
 LESSON_NAME_MAPPING = {
@@ -157,6 +164,203 @@ def json_safe(value):
         except Exception:
             pass
     return value
+
+
+def normalize_arabic_text(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value
+    normalized = re.sub(r"[\u064B-\u065F\u0670\u06D6-\u06ED]", "", normalized)
+    normalized = normalized.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = re.sub(r"[\u061F\u060C\u061B\.,!\?؛،:\(\)\"'\-ـ]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def merge_tafsir_into_quran(df_quran_base: pd.DataFrame, df_tafsir: pd.DataFrame) -> pd.DataFrame:
+    quran = df_quran_base.copy()
+    tafsir = df_tafsir.copy()
+
+    required_tafsir_columns = {"surah_name_roman", "ayah_ar", "tafsir"}
+    if not required_tafsir_columns.issubset(set(tafsir.columns)):
+        logger.warning(
+            f"⚠ Tafsir dataset missing required columns: {required_tafsir_columns}. Found: {list(tafsir.columns)}"
+        )
+        if "tafsir" not in quran.columns:
+            quran["tafsir"] = None
+        return quran
+
+    quran["_merge_surah_roman"] = quran["surah_name_roman"].fillna("").astype(str).str.strip().str.lower()
+    quran["_merge_ayah_ar"] = quran["ayah_ar"].fillna("").astype(str).apply(normalize_arabic_text)
+
+    tafsir["_merge_surah_roman"] = tafsir["surah_name_roman"].fillna("").astype(str).str.strip().str.lower()
+    tafsir["_merge_ayah_ar"] = tafsir["ayah_ar"].fillna("").astype(str).apply(normalize_arabic_text)
+
+    tafsir_map = (
+        tafsir[["_merge_surah_roman", "_merge_ayah_ar", "tafsir"]]
+        .dropna(subset=["tafsir"])
+        .drop_duplicates(subset=["_merge_surah_roman", "_merge_ayah_ar"], keep="first")
+    )
+
+    merged = quran.merge(
+        tafsir_map,
+        on=["_merge_surah_roman", "_merge_ayah_ar"],
+        how="left",
+    )
+
+    if "tafsir_x" in merged.columns or "tafsir_y" in merged.columns:
+        merged["tafsir"] = merged.get("tafsir_x").where(
+            merged.get("tafsir_x").notna(),
+            merged.get("tafsir_y"),
+        )
+        merged = merged.drop(columns=[col for col in ["tafsir_x", "tafsir_y"] if col in merged.columns])
+
+    merged = merged.drop(columns=["_merge_surah_roman", "_merge_ayah_ar"], errors="ignore")
+
+    matched_count = merged["tafsir"].notna().sum() if "tafsir" in merged.columns else 0
+    logger.info(f"✓ Tafsir merged: {matched_count}/{len(merged)} ayahs matched")
+    return merged
+
+
+def load_recitation_model() -> Optional[dict]:
+    model_candidates = [
+        Path(RECITATION_MODEL_PATH),
+        Path("./backend/models/recitation_retrieval_model.joblib"),
+        Path("./models/recitation_retrieval_model.joblib"),
+    ]
+    model_path = next((p for p in model_candidates if p.exists()), None)
+    if model_path is None:
+        logger.warning(f"⚠ Recitation model not found. Tried: {[str(p) for p in model_candidates]}")
+        return None
+
+    try:
+        bundle = joblib.load(model_path)
+        logger.info(f"✓ Recitation NLP model loaded from {model_path}")
+        return bundle
+    except Exception as e:
+        logger.warning(f"⚠ Failed to load recitation model at {model_path}: {e}")
+        return None
+
+
+def build_recitation_model_from_quran_dataframe(quran_frame: Optional[pd.DataFrame]) -> Optional[dict]:
+    if quran_frame is None or quran_frame.empty:
+        return None
+
+    try:
+        corpus = quran_frame.copy()
+        required_columns = [
+            "surah_no",
+            "surah_name_ar",
+            "ayah_no_surah",
+            "ayah_no_quran",
+            "ayah_ar",
+            "ayah_en",
+        ]
+        missing = [col for col in required_columns if col not in corpus.columns]
+        if missing:
+            logger.warning(f"⚠ Cannot build recitation model in-memory; missing columns: {missing}")
+            return None
+
+        if "tafsir" not in corpus.columns:
+            corpus["tafsir"] = None
+
+        corpus["ayah_ar"] = corpus["ayah_ar"].fillna("").astype(str)
+        corpus["ayah_en"] = corpus["ayah_en"].fillna("").astype(str)
+        corpus["tafsir"] = corpus["tafsir"].fillna("").astype(str)
+        corpus["surah_name_ar"] = corpus["surah_name_ar"].fillna("").astype(str)
+        corpus["train_text"] = corpus["ayah_ar"].map(normalize_arabic_text)
+        corpus = corpus[corpus["train_text"].str.len() > 0].copy()
+        if corpus.empty:
+            logger.warning("⚠ Cannot build recitation model in-memory; no valid training text after normalization")
+            return None
+
+        corpus["target_id"] = corpus["surah_no"].astype(str) + ":" + corpus["ayah_no_surah"].astype(str)
+        corpus["target_label"] = corpus["surah_name_ar"].astype(str) + " — " + corpus["ayah_no_surah"].astype(str)
+
+        vectorizer = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=1,
+            lowercase=False,
+        )
+        X_corpus = vectorizer.fit_transform(corpus["train_text"])
+        retriever = NearestNeighbors(n_neighbors=3, metric="cosine", algorithm="brute")
+        retriever.fit(X_corpus)
+
+        bundle = {
+            "vectorizer": vectorizer,
+            "retriever": retriever,
+            "corpus": corpus[
+                [
+                    "surah_no",
+                    "surah_name_ar",
+                    "ayah_no_surah",
+                    "ayah_no_quran",
+                    "ayah_ar",
+                    "ayah_en",
+                    "tafsir",
+                    "target_id",
+                    "target_label",
+                    "train_text",
+                ]
+            ].reset_index(drop=True),
+            "normalize_version": "arabic_diacritics_runtime_v1",
+        }
+        logger.info(f"✓ Recitation NLP model built in-memory from Quran dataframe ({len(corpus)} ayahs)")
+        return bundle
+    except Exception as e:
+        logger.warning(f"⚠ Failed to build in-memory recitation model: {e}")
+        return None
+
+
+class RecitationMatchRequest(BaseModel):
+    transcript: str
+    top_k: int = 3
+
+
+def predict_recitation_matches(transcript: str, top_k: int = 3) -> List[dict]:
+    if recitation_model_bundle is None:
+        raise RuntimeError("Recitation model not loaded")
+
+    cleaned = normalize_arabic_text(transcript)
+    if not cleaned:
+        return []
+
+    vectorizer = recitation_model_bundle.get("vectorizer")
+    retriever = recitation_model_bundle.get("retriever")
+    corpus = recitation_model_bundle.get("corpus")
+    if vectorizer is None or retriever is None or corpus is None:
+        raise RuntimeError("Recitation model bundle is missing required keys")
+
+    corpus_df = corpus if isinstance(corpus, pd.DataFrame) else pd.DataFrame(corpus)
+    if corpus_df.empty:
+        return []
+
+    n_neighbors = max(1, min(int(top_k), len(corpus_df)))
+    vector = vectorizer.transform([cleaned])
+    distances, indices = retriever.kneighbors(vector, n_neighbors=n_neighbors)
+
+    matches = []
+    for rank, (distance, idx) in enumerate(zip(distances[0], indices[0]), start=1):
+        row = corpus_df.iloc[int(idx)]
+        score = 1.0 - float(distance)
+        matches.append({
+            "rank": rank,
+            "score": round(score, 6),
+            "distance": float(distance),
+            "surah_no": int(row.get("surah_no", 0)),
+            "surah_name_ar": row.get("surah_name_ar"),
+            "ayah_no_surah": int(row.get("ayah_no_surah", 0)),
+            "ayah_no_quran": int(row.get("ayah_no_quran", 0)),
+            "ayah_ar": row.get("ayah_ar"),
+            "ayah_en": row.get("ayah_en"),
+            "tafsir": row.get("tafsir"),
+            "target_id": row.get("target_id"),
+            "target_label": row.get("target_label"),
+        })
+
+    return matches
 
 
 def sync_google_drive_folder() -> dict:
@@ -316,7 +520,7 @@ class AudioMetadata(BaseModel):
 # Load dataset
 @app.on_event("startup")
 async def load_dataset():
-    global df_dataset, df_quran
+    global df_dataset, df_quran, recitation_model_bundle
     dataset_path_candidates = [LOCAL_DATASET_METADATA_PATH, "./data/metadataset.csv"]
     dataset_path = next((path for path in dataset_path_candidates if os.path.exists(path)), None)
     if dataset_path:
@@ -336,11 +540,28 @@ async def load_dataset():
     if os.path.exists(QURAN_DATASET_PATH):
         df_quran = pd.read_csv(QURAN_DATASET_PATH)
         logger.info(f"✓ Quran dataset loaded: {len(df_quran)} ayahs")
+
+        if os.path.exists(QURAN_TAFSIR_DATASET_PATH):
+            try:
+                df_tafsir = pd.read_csv(QURAN_TAFSIR_DATASET_PATH)
+                logger.info(f"✓ Tafsir dataset loaded: {len(df_tafsir)} rows")
+                df_quran = merge_tafsir_into_quran(df_quran, df_tafsir)
+            except Exception as e:
+                logger.warning(f"⚠ Failed to merge tafsir dataset: {e}")
+                if "tafsir" not in df_quran.columns:
+                    df_quran["tafsir"] = None
+        else:
+            logger.warning(f"⚠ Tafsir dataset not found at {QURAN_TAFSIR_DATASET_PATH}")
+            if "tafsir" not in df_quran.columns:
+                df_quran["tafsir"] = None
     else:
         logger.warning(f"⚠ Quran dataset not found at {QURAN_DATASET_PATH}")
         df_quran = None
 
     initialize_firebase()
+    recitation_model_bundle = load_recitation_model()
+    if recitation_model_bundle is None:
+        recitation_model_bundle = build_recitation_model_from_quran_dataframe(df_quran)
 
 # Routes
 @app.get("/")
@@ -359,7 +580,33 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "noor-al-quran-backend"}
+    return {
+        "status": "healthy",
+        "service": "noor-al-quran-backend",
+        "recitation_model_loaded": recitation_model_bundle is not None,
+    }
+
+
+@app.post("/api/nlp/match-ayah")
+async def match_recited_ayah(payload: RecitationMatchRequest):
+    if recitation_model_bundle is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Recitation NLP model is not loaded. Train and save backend/models/recitation_retrieval_model.joblib first.",
+        )
+
+    transcript = (payload.transcript or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Transcript is required")
+
+    top_k = max(1, min(int(payload.top_k or 3), 10))
+    matches = predict_recitation_matches(transcript, top_k=top_k)
+    return {
+        "transcript": transcript,
+        "normalized_transcript": normalize_arabic_text(transcript),
+        "top_k": top_k,
+        "matches": matches,
+    }
 
 @app.get("/api/lessons")
 async def get_lessons(label_name: Optional[str] = None):
@@ -558,6 +805,7 @@ async def get_quran_surah(surah_no: int):
             'ayah_no_quran': int(row['ayah_no_quran']),
             'ayah_ar': json_safe(row['ayah_ar']),
             'ayah_en': json_safe(row['ayah_en']),
+            'tafsir': json_safe(row.get('tafsir')),
             'ruko_no': json_safe(row.get('ruko_no')),
             'juz_no': json_safe(row.get('juz_no')),
             'manzil_no': json_safe(row.get('manzil_no')),

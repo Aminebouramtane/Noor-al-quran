@@ -17,11 +17,13 @@ import Stats from './pages/Stats';
 import NotificationsSettings from './pages/NotificationsSettings';
 import SoundSettings from './pages/SoundSettings';
 import Help from './pages/Help';
+import NotificationManager from './components/NotificationManager';
 
 export default function App() {
   return (
     <Router>
       <AuthProvider>
+        <NotificationManager />
         <Routes>
           <Route path="/" element={<Splash />} />
           <Route path="/onboarding" element={<Onboarding />} />
