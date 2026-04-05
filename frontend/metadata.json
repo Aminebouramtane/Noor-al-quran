@@ -1,0 +1,7 @@
+{
+  "name": "نور القرآن (Noor Al-Quran)",
+  "description": "A premium editorial Quran learning and Tajweed correction application powered by AI.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
