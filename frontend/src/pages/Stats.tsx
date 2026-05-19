@@ -4,6 +4,8 @@ import { motion } from 'motion/react';
 import Header from '../components/Header';
 import BottomNav from '../components/BottomNav';
 import { api } from '../lib/api';
+import { useAuth } from '../contexts/AuthContext';
+import { loadHeartProgress, type HeartSurahProgress } from '../lib/readingProgress';
 
 interface StatsResponse {
   samples_by_label: Record<string, number>;
@@ -34,9 +36,11 @@ const numberFormatter = new Intl.NumberFormat('ar-EG');
 const formatNumber = (value: number) => numberFormatter.format(value);
 
 export default function Stats() {
+  const { user } = useAuth();
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [lessonCount, setLessonCount] = useState(0);
   const [surahCount, setSurahCount] = useState(0);
+  const [readingProgress, setReadingProgress] = useState<Record<string, HeartSurahProgress>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -59,6 +63,7 @@ export default function Stats() {
         setStats(statsData);
         setLessonCount((lessonsData as LessonsResponse).total || 0);
         setSurahCount((surahData as SurahsResponse).total_surahs || (surahData.surahs?.length ?? 0));
+        setReadingProgress(loadHeartProgress(user?.uid));
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'تعذر تحميل الإحصائيات');
@@ -75,7 +80,7 @@ export default function Stats() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [user?.uid]);
 
   const totalSamples = stats?.total_samples ?? 0;
   const playableTotal = stats?.playable_total ?? 0;
@@ -98,6 +103,22 @@ export default function Stats() {
     const entries = Object.entries(stats?.playable_by_sheikh || {}).sort((left, right) => Number(right[1]) - Number(left[1]));
     return entries[0];
   }, [stats]);
+
+  const progressItems = useMemo(() => {
+    return Object.values(readingProgress)
+      .filter((item) => item.progressPercent > 0)
+      .sort((left, right) => right.progressPercent - left.progressPercent || left.surahNo - right.surahNo);
+  }, [readingProgress]);
+
+  const progressAverage = useMemo(() => {
+    if (!progressItems.length) return 0;
+    const total = progressItems.reduce((sum, item) => sum + item.progressPercent, 0);
+    return Math.round(total / progressItems.length);
+  }, [progressItems]);
+
+  const progressCompletedCount = useMemo(() => {
+    return progressItems.filter((item) => item.progressPercent >= 100).length;
+  }, [progressItems]);
 
   const weeklyProgress = useMemo(() => {
     if (!topLabels.length) return [20, 35, 45, 55, 60, 75, 82];
@@ -137,6 +158,71 @@ export default function Stats() {
               <p className="text-lg md:text-xl font-headline font-bold leading-snug">{card.value}</p>
             </div>
           ))}
+        </section>
+
+        <section className="bg-surface-container-lowest rounded-[2rem] p-6 md:p-7 border border-outline-variant/10 shadow-sm">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2 mb-6">
+            <div>
+              <h3 className="text-xl font-headline font-bold">تقدم القراءة</h3>
+              <p className="text-sm text-on-surface-variant mt-1">كل سورة مقروءة تُعرض هنا حسب آخر آية وصلت إليها.</p>
+            </div>
+            <span className="text-xs text-on-surface-variant">بيانات محلية خاصة بالحساب الحالي</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            {[
+              { label: 'السور التي بدأت', value: formatNumber(progressItems.length) },
+              { label: 'السور المكتملة', value: formatNumber(progressCompletedCount) },
+              { label: 'متوسط التقدم', value: `${formatNumber(progressAverage)}%` },
+            ].map((item) => (
+              <div key={item.label} className="rounded-2xl bg-surface-container-low p-4 border border-outline-variant/10">
+                <p className="text-xs text-on-surface-variant mb-1">{item.label}</p>
+                <p className="text-2xl font-headline font-bold text-primary">{item.value}</p>
+              </div>
+            ))}
+          </div>
+
+          {progressItems.length ? (
+            <div className="space-y-3">
+              {progressItems.map((item, index) => {
+                const width = Math.max(item.progressPercent, 4);
+                return (
+                  <motion.div
+                    key={item.surahNo}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3, delay: index * 0.04 }}
+                    className="rounded-2xl border border-outline-variant/10 bg-surface-container-low p-4"
+                  >
+                    <div className="flex items-center justify-between gap-3 mb-3">
+                      <div>
+                        <h4 className="font-headline font-bold text-on-surface">{item.surahNameAr}</h4>
+                        <p className="text-xs text-on-surface-variant mt-1">
+                          آخر آية: {formatNumber(item.lastAyahNo)} / {formatNumber(item.totalAyahs)}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-2xl font-headline font-bold text-primary">{formatNumber(item.progressPercent)}%</p>
+                        <p className="text-xs text-on-surface-variant">{item.progressPercent >= 100 ? 'مكتملة' : 'قيد المتابعة'}</p>
+                      </div>
+                    </div>
+                    <div className="w-full h-4 rounded-full bg-surface-container-high overflow-hidden">
+                      <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${width}%` }}
+                        transition={{ duration: 0.5, delay: index * 0.04 }}
+                        className="h-full rounded-full bg-gradient-to-r from-primary to-primary-container"
+                      />
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-dashed border-outline-variant/20 p-6 text-sm text-on-surface-variant">
+              لا يوجد تقدم قراءة محفوظ لهذا الحساب بعد.
+            </div>
+          )}
         </section>
 
         <section className="bg-surface-container-lowest rounded-[2rem] p-6 md:p-7 border border-outline-variant/10 shadow-sm">

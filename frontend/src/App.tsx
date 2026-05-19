@@ -12,6 +12,7 @@ import LessonDetail from './pages/LessonDetail';
 import Reading from './pages/Reading';
 import RecordingPage from './pages/RecordingPage';
 import NlpRecitation from './pages/NlpRecitation';
+import HeartPage from './pages/HeartPage';
 import Profile from './pages/Profile';
 import Stats from './pages/Stats';
 import NotificationsSettings from './pages/NotificationsSettings';
@@ -130,6 +131,22 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <NlpRecitation />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/heart"
+            element={
+              <ProtectedRoute>
+                <HeartPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/heart/:surahNo"
+            element={
+              <ProtectedRoute>
+                <HeartPage />
               </ProtectedRoute>
             }
           />

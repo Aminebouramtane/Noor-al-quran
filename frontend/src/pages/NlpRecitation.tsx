@@ -4,7 +4,6 @@ import { ArrowRight, CheckCircle2, Heart, Mic, MicOff, RefreshCcw } from 'lucide
 import Header from '../components/Header';
 import BottomNav from '../components/BottomNav';
 import { api } from '../lib/api';
-import quranHeartRaw from '../assets/quran-heart.svg?raw';
 import { useAuth } from '../contexts/AuthContext';
 import { writeAyahAttempt, writeSurahCompletion } from '../lib/firebaseCollections';
 
@@ -48,6 +47,12 @@ type WordStatus = {
   isCorrect: boolean;
 };
 
+type AyahMistakeDetail = {
+  ayahNo: number;
+  mistakes: number;
+  pairs: Array<{ expected: string; heard: string }>;
+};
+
 type SpeechRecognitionCtor = new () => {
   lang: string;
   continuous: boolean;
@@ -76,12 +81,16 @@ type NlpAyahMatch = {
 };
 
 const COMPLETION_STORAGE_KEY = 'noor:surahCompletions';
+const COMPLETION_CHANGED_EVENT = 'noor:surahCompletionsChanged';
 const arabicNumber = (value: number) => new Intl.NumberFormat('ar-EG').format(value);
 
 const normalizeArabic = (value: string) =>
   value
     .replace(/[\u064B-\u065F\u0670\u06D6-\u06ED]/g, '')
     .replace(/[أإآ]/g, 'ا')
+    .replace(/ٱ/g, 'ا')
+    .replace(/ؤ/g, 'و')
+    .replace(/ئ/g, 'ي')
     .replace(/ى/g, 'ي')
     .replace(/ة/g, 'ه')
     .replace(/[\u061F\u060C\u061B.,!?؛،:()"'\-ـ]/g, ' ')
@@ -94,7 +103,83 @@ const tokenize = (value: string) =>
     .map((part) => part.trim())
     .filter(Boolean);
 
+const alignSpokenToTarget = (targetText: string, spokenText: string) => {
+  const targetWords = tokenize(targetText);
+  const spokenWords = tokenize(spokenText);
+
+  if (!targetWords.length) {
+    return { targetWords, spokenWords, alignedSpoken: [] as string[], offset: 0 };
+  }
+
+  if (!spokenWords.length) {
+    return { targetWords, spokenWords, alignedSpoken: [] as string[], offset: 0 };
+  }
+
+  let bestOffset = 0;
+  let bestCorrect = -1;
+  const maxOffset = Math.max(0, spokenWords.length - 1);
+
+  for (let offset = 0; offset <= maxOffset; offset += 1) {
+    let correct = 0;
+    for (let i = 0; i < targetWords.length && i + offset < spokenWords.length; i += 1) {
+      if (targetWords[i] === spokenWords[i + offset]) {
+        correct += 1;
+      }
+    }
+
+    if (correct > bestCorrect) {
+      bestCorrect = correct;
+      bestOffset = offset;
+    }
+  }
+
+  const alignedSpoken = spokenWords.slice(bestOffset, bestOffset + targetWords.length);
+  return { targetWords, spokenWords, alignedSpoken, offset: bestOffset };
+};
+
 const normalizeSurahName = (value: string) => normalizeArabic(value).replace(/\s+/g, '');
+
+const calculateMistakes = (targetText: string, spokenText: string) => {
+  const { targetWords, alignedSpoken } = alignSpokenToTarget(targetText, spokenText);
+  const correctWords = alignedSpoken.filter((word, index) => targetWords[index] === word).length;
+  return Math.max(0, Math.max(targetWords.length, alignedSpoken.length) - correctWords);
+};
+
+const buildMistakePairs = (targetText: string, spokenText: string, maxPairs: number = 8) => {
+  const { targetWords, alignedSpoken } = alignSpokenToTarget(targetText, spokenText);
+  const pairs: Array<{ expected: string; heard: string }> = [];
+  const maxLen = Math.max(targetWords.length, alignedSpoken.length);
+
+  for (let i = 0; i < maxLen; i += 1) {
+    const expected = targetWords[i] ?? '—';
+    const heard = alignedSpoken[i] ?? '—';
+    if (expected !== heard) {
+      pairs.push({ expected, heard });
+      if (pairs.length >= maxPairs) break;
+    }
+  }
+
+  return pairs;
+};
+
+const transcriptContainsRemainingSurah = (transcript: string, ayahs: QuranAyah[], startAyahNo: number) => {
+  const normalizedTranscript = normalizeArabic(transcript);
+  if (!normalizedTranscript) return false;
+
+  let cursor = 0;
+  for (const ayah of ayahs.slice(Math.max(0, startAyahNo - 1))) {
+    const normalizedAyah = normalizeArabic(ayah.ayah_ar);
+    if (!normalizedAyah) return false;
+
+    const index = normalizedTranscript.indexOf(normalizedAyah, cursor);
+    if (index === -1) return false;
+    cursor = index + normalizedAyah.length;
+  }
+
+  return true;
+};
+
+const MIN_AUTO_MATCH_SCORE = 0.35;
 
 const loadCompletions = () => {
   try {
@@ -107,6 +192,7 @@ const loadCompletions = () => {
 
 const saveCompletions = (value: Record<string, SurahCompletion>) => {
   localStorage.setItem(COMPLETION_STORAGE_KEY, JSON.stringify(value));
+  window.dispatchEvent(new Event(COMPLETION_CHANGED_EVENT));
 };
 
 export default function NlpRecitation() {
@@ -115,7 +201,7 @@ export default function NlpRecitation() {
   const { user } = useAuth();
 
   const recognitionRef = useRef<InstanceType<SpeechRecognitionCtor> | null>(null);
-  const heartSvgRef = useRef<HTMLDivElement>(null);
+  const keepListeningRef = useRef(false);
   const transcriptRef = useRef('');
 
   const [surahs, setSurahs] = useState<SurahSummary[]>([]);
@@ -130,91 +216,25 @@ export default function NlpRecitation() {
   const [modelLoading, setModelLoading] = useState(false);
   const [modelMatches, setModelMatches] = useState<NlpAyahMatch[]>([]);
   const [completions, setCompletions] = useState<Record<string, SurahCompletion>>({});
+  const [autoTilawaEnabled, setAutoTilawaEnabled] = useState(false);
+  const [sessionFinished, setSessionFinished] = useState(false);
+  const [nlpHint, setNlpHint] = useState('');
+  const [ayahMistakeDetails, setAyahMistakeDetails] = useState<AyahMistakeDetail[]>([]);
+  const [showMistakeDetails, setShowMistakeDetails] = useState(false);
 
   const completionItems = useMemo(() => Object.values(completions) as SurahCompletion[], [completions]);
 
-  const [clickedSurahNames, setClickedSurahNames] = useState<Set<string>>(new Set());
-
   useEffect(() => {
     setCompletions(loadCompletions());
+
+    const onCompletionChanged = () => {
+      setCompletions(loadCompletions());
+    };
+
+    window.addEventListener(COMPLETION_CHANGED_EVENT, onCompletionChanged);
+    return () => window.removeEventListener(COMPLETION_CHANGED_EVENT, onCompletionChanged);
   }, []);
 
-  const handleSurahHeartClick = async (surahNameAr: string) => {
-    if (!surahNameAr.trim()) return;
-
-    const normalized = normalizeSurahName(surahNameAr);
-    const isAlreadyClicked = clickedSurahNames.has(normalized);
-
-    setClickedSurahNames((prev) => {
-      const next = new Set(prev);
-      if (isAlreadyClicked) {
-        next.delete(normalized);
-      } else {
-        next.add(normalized);
-      }
-      return next;
-    });
-
-    if (isAlreadyClicked || !user?.uid) return;
-
-    const surahMatch = surahs.find(
-      (s) => normalizeSurahName(s.surah_name_ar) === normalized
-    );
-
-    if (!surahMatch) {
-      setError('لم يتم العثور على السورة المطابقة في البيانات.');
-      return;
-    }
-
-    try {
-      await writeSurahCompletion(user.uid, {
-        surahNo: surahMatch.surah_no,
-        surahNameAr: surahMatch.surah_name_ar,
-        totalMistakes: 0,
-        completedWithLessThan10Mistakes: true,
-      });
-
-      const nextCompletions = {
-        ...completions,
-        [surahMatch.surah_no]: {
-          surahNo: surahMatch.surah_no,
-          surahNameAr: surahMatch.surah_name_ar,
-          mistakes: 0,
-          completedAt: new Date().toISOString(),
-        },
-      };
-      setCompletions(nextCompletions);
-      saveCompletions(nextCompletions);
-
-      console.log('✅ Saved to Firestore:', surahMatch.surah_name_ar);
-      setError('');
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'تعذر حفظ السورة في قاعدة البيانات.';
-      setError(`تعذر حفظ السورة في قاعدة البيانات: ${message}`);
-      console.error('❌ Firestore write failed:', err);
-      setClickedSurahNames((prev) => {
-        const next = new Set(prev);
-        next.delete(normalized);
-        return next;
-      });
-    }
-  };
-
-  const handleHeartContainerClick = (event: React.MouseEvent<HTMLDivElement>) => {
-    const target = event.target as Element | null;
-    if (!target || !heartSvgRef.current) return;
-
-    const group = target.closest('.surah-group');
-    if (!group || !heartSvgRef.current.contains(group)) return;
-
-    const nameElement = group.querySelector('.surah-name');
-    const surahName = (nameElement?.textContent || '').trim();
-    if (!surahName) return;
-
-    console.log('🖱️ Clicked surah:', surahName);
-    void handleSurahHeartClick(surahName);
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -266,6 +286,10 @@ export default function NlpRecitation() {
         setActiveAyahNo(1);
         setRecognizedText('');
         setTotalMistakes(0);
+        setSessionFinished(false);
+        setNlpHint('');
+        setAyahMistakeDetails([]);
+        setShowMistakeDetails(false);
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'تعذر تحميل السورة');
@@ -302,17 +326,29 @@ export default function NlpRecitation() {
 
   const currentAyah = surah?.ayahs.find((ayah) => ayah.ayah_no_surah === activeAyahNo) || null;
 
-  const comparison = useMemo(() => {
-    const spokenWords = tokenize(recognizedText);
-    const targetWords = tokenize(currentAyah?.ayah_ar || '');
+  const isFullSurahTranscript = useMemo(() => {
+    if (!surah || !recognizedText.trim()) return false;
+    return transcriptContainsRemainingSurah(recognizedText, surah.ayahs, activeAyahNo);
+  }, [surah, recognizedText, activeAyahNo]);
 
-    const tokens: WordStatus[] = spokenWords.map((word, index) => ({
+  const comparisonTargetText = useMemo(() => {
+    if (!surah || !currentAyah) return '';
+    if (isFullSurahTranscript) {
+      return surah.ayahs.slice(Math.max(0, activeAyahNo - 1)).map((ayah) => ayah.ayah_ar).join(' ');
+    }
+    return currentAyah.ayah_ar;
+  }, [surah, currentAyah, isFullSurahTranscript, activeAyahNo]);
+
+  const comparison = useMemo(() => {
+    const { spokenWords, targetWords, alignedSpoken } = alignSpokenToTarget(comparisonTargetText, recognizedText);
+
+    const tokens: WordStatus[] = alignedSpoken.map((word, index) => ({
       word,
       isCorrect: targetWords[index] === word,
     }));
 
     const correctWords = tokens.filter((item) => item.isCorrect).length;
-    const mistakes = Math.max(targetWords.length, spokenWords.length) - correctWords;
+    const mistakes = Math.max(targetWords.length, alignedSpoken.length) - correctWords;
 
     return {
       tokens,
@@ -320,76 +356,13 @@ export default function NlpRecitation() {
       spokenWordsCount: spokenWords.length,
       targetWordsCount: targetWords.length,
     };
-  }, [recognizedText, currentAyah?.ayah_ar]);
-
-  const completedSurahNameSet = useMemo(() => {
-    const names = completionItems
-      .filter((entry) => entry.mistakes < 10)
-      .map((entry) => normalizeSurahName(entry.surahNameAr));
-
-    return new Set([...names, ...clickedSurahNames]);
-  }, [completionItems, clickedSurahNames]);
-
-  const heartSvgMarkup = useMemo(() => {
-    try {
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(quranHeartRaw, 'image/svg+xml');
-      const svg = doc.querySelector('svg');
-
-      if (!svg) return quranHeartRaw;
-
-      svg.setAttribute('style', 'display:block; width:100%; height:auto; max-height:540px; direction:ltr;');
-      svg.setAttribute('direction', 'ltr');
-
-      const styleTag = doc.createElementNS('http://www.w3.org/2000/svg', 'style');
-      styleTag.textContent = `
-        .surah-name {
-          font-size: 9px;
-          font-weight: 700;
-          font-family: Tajawal, Arial, sans-serif;
-          direction: ltr;
-          unicode-bidi: isolate;
-        }
-      `;
-      svg.prepend(styleTag);
-
-      const groups = doc.querySelectorAll('.surah-group');
-      groups.forEach((group) => {
-        const nameElement = group.querySelector('.surah-name');
-        const pathElements = group.querySelectorAll('.surah-path');
-        const name = normalizeSurahName(nameElement?.textContent || '');
-        const isCompleted = completedSurahNameSet.has(name);
-
-        pathElements.forEach((pathElement) => {
-          pathElement.setAttribute('fill', isCompleted ? '#0d631b' : '#ffffff');
-          pathElement.setAttribute('stroke', '#c9ced6');
-          pathElement.setAttribute('stroke-width', '0.6');
-          pathElement.setAttribute('cursor', 'pointer');
-          pathElement.setAttribute('class', 'surah-path clickable-surah');
-        });
-
-        if (nameElement) {
-          nameElement.setAttribute('fill', isCompleted ? '#ffffff' : '#111827');
-          nameElement.setAttribute('font-size', '9px');
-          nameElement.setAttribute('font-weight', '700');
-          nameElement.setAttribute('font-family', 'Tajawal, Arial, sans-serif');
-          nameElement.setAttribute('cursor', 'pointer');
-        }
-
-        (group as any).style.cursor = 'pointer';
-      });
-
-      return svg.outerHTML;
-    } catch {
-      return quranHeartRaw;
-    }
-  }, [completedSurahNameSet]);
+  }, [recognizedText, comparisonTargetText]);
 
   const analyzeRecitationWithModel = async (transcript: string) => {
     const clean = transcript.trim();
     if (!clean) {
       setModelMatches([]);
-      return;
+      return [] as NlpAyahMatch[];
     }
 
     try {
@@ -398,25 +371,133 @@ export default function NlpRecitation() {
       const matches = (result?.matches || []) as NlpAyahMatch[];
       setModelMatches(matches);
 
-      if (matches.length > 0) {
-        const top = matches[0];
-        if (selectedSurahNo !== top.surah_no) {
-          setSelectedSurahNo(top.surah_no);
-          navigate(`/nlp-reading/${top.surah_no}`);
-        }
-        if (top.ayah_no_surah > 0) {
-          setActiveAyahNo(top.ayah_no_surah);
-        }
-      }
+      return matches;
     } catch {
       setError('تعذر تحليل التلاوة بالنموذج حالياً.');
+      return [] as NlpAyahMatch[];
     } finally {
       setModelLoading(false);
     }
   };
 
+  const advanceAyah = async (spokenText: string, mistakes: number) => {
+    if (!surah || !currentAyah) return;
+
+    const nextTotalMistakes = totalMistakes + mistakes;
+    const isLastAyah = activeAyahNo >= surah.ayahs.length;
+
+    if (user?.uid) {
+      try {
+        await writeAyahAttempt(user.uid, {
+          surahNo: surah.surah_no,
+          surahNameAr: surah.surah_name_ar,
+          ayahNo: currentAyah.ayah_no_surah,
+          targetAyahText: currentAyah.ayah_ar,
+          recognizedText: spokenText,
+          mistakes,
+          isLastAyah,
+        });
+      } catch {
+        setError('تمت المتابعة، لكن تعذر تسجيل المحاولة في قاعدة البيانات حالياً.');
+      }
+    }
+
+    setTotalMistakes(nextTotalMistakes);
+
+    if (mistakes > 0) {
+      const nextDetail: AyahMistakeDetail = {
+        ayahNo: currentAyah.ayah_no_surah,
+        mistakes,
+        pairs: buildMistakePairs(currentAyah.ayah_ar, spokenText),
+      };
+
+      setAyahMistakeDetails((prev) => {
+        const remaining = prev.filter((item) => item.ayahNo !== nextDetail.ayahNo);
+        return [...remaining, nextDetail].sort((a, b) => a.ayahNo - b.ayahNo);
+      });
+    }
+
+    if (isLastAyah) {
+      await completeSurahIfQualified(nextTotalMistakes);
+      setSessionFinished(true);
+      setAutoTilawaEnabled(false);
+      setError('');
+      setNlpHint(nextTotalMistakes < 10
+        ? 'تمت تلاوة السورة كاملة وحُفظت كـ مكتملة في قلب السور.'
+        : 'تمت تلاوة السورة كاملة، لكن الأخطاء 10 أو أكثر لذلك لم تتحول إلى اللون الأخضر بعد.');
+      return;
+    }
+
+    setActiveAyahNo((prev) => prev + 1);
+    setRecognizedText('');
+    setError('');
+  };
+
+  const completeFromTranscriptIfWholeSurah = async (transcript: string) => {
+    if (!surah) return false;
+    let modelMatched = false;
+    const remainingAyahCount = Math.max(0, surah.ayahs.length - activeAyahNo + 1);
+    try {
+      const compare = await api.compareRecitedSurah(transcript, surah.surah_no, activeAyahNo);
+      modelMatched = Boolean(
+        compare?.is_match
+        && Number(compare?.matched_ayahs || 0) >= remainingAyahCount
+        && Number(compare?.coverage_ratio || 0) >= 0.999
+      );
+    } catch {
+      // Fallback to local containment heuristic if backend compare is temporarily unavailable.
+      modelMatched = transcriptContainsRemainingSurah(transcript, surah.ayahs, activeAyahNo);
+    }
+
+    if (!modelMatched) return false;
+
+    const fullSurahMistakes = 0;
+    setTotalMistakes(fullSurahMistakes);
+    await completeSurahIfQualified(fullSurahMistakes);
+    setSessionFinished(true);
+    setAutoTilawaEnabled(false);
+    setActiveAyahNo(surah.ayahs.length);
+    setRecognizedText(transcript);
+    setError('');
+    setNlpHint('تم التعرف على السورة كاملة بشكل صحيح، وتم احتسابها في القلب باللون الأخضر.');
+    return true;
+  };
+
+  const handleAutoTilawaProgress = async (transcript: string, matches: NlpAyahMatch[]) => {
+    if (!surah || !currentAyah || !matches.length) {
+      setNlpHint('لم يتعرف النموذج على آية واضحة. أعد القراءة بوضوح أكثر.');
+      return;
+    }
+
+    const top = matches[0];
+    if (top.surah_no !== surah.surah_no) {
+      setNlpHint(`النموذج رجّح سورة ${top.surah_name_ar}، وأنت في سورة ${surah.surah_name_ar}. أكمل نفس السورة الحالية.`);
+      return;
+    }
+
+    if (top.score < MIN_AUTO_MATCH_SCORE) {
+      setNlpHint(`الثقة منخفضة (${(top.score * 100).toFixed(1)}%). أعد تلاوة نفس الآية.`);
+      return;
+    }
+
+    if (top.ayah_no_surah < activeAyahNo) {
+      setNlpHint('يبدو أنك أعدت آية سابقة. أكمل من الآية الحالية.');
+      return;
+    }
+
+    if (top.ayah_no_surah > activeAyahNo) {
+      setNlpHint('تم التعرف على آية لاحقة. سننتقل لها ونكمل التلاوة منها.');
+      setActiveAyahNo(top.ayah_no_surah);
+      return;
+    }
+
+    const mistakes = calculateMistakes(currentAyah.ayah_ar, transcript);
+    await advanceAyah(transcript, mistakes);
+  };
+
   const startListening = () => {
     setError('');
+    keepListeningRef.current = true;
 
     const SpeechRecognition = (window as Window & { SpeechRecognition?: SpeechRecognitionCtor; webkitSpeechRecognition?: SpeechRecognitionCtor }).SpeechRecognition
       || (window as Window & { webkitSpeechRecognition?: SpeechRecognitionCtor }).webkitSpeechRecognition;
@@ -430,7 +511,7 @@ export default function NlpRecitation() {
 
     const recognition = new SpeechRecognition();
     recognition.lang = 'ar-SA';
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
 
@@ -450,8 +531,27 @@ export default function NlpRecitation() {
     recognition.onend = () => {
       setIsListening(false);
       const finalTranscript = transcriptRef.current.trim();
+      recognitionRef.current = null;
       if (finalTranscript) {
-        void analyzeRecitationWithModel(finalTranscript);
+        void (async () => {
+          const matches = await analyzeRecitationWithModel(finalTranscript);
+
+          if (await completeFromTranscriptIfWholeSurah(finalTranscript)) {
+            return;
+          }
+
+          if (autoTilawaEnabled && !sessionFinished) {
+            await handleAutoTilawaProgress(finalTranscript, matches);
+          }
+        })();
+      }
+
+      if (keepListeningRef.current && !sessionFinished) {
+        window.setTimeout(() => {
+          if (keepListeningRef.current && !sessionFinished) {
+            startListening();
+          }
+        }, 250);
       }
     };
 
@@ -461,6 +561,7 @@ export default function NlpRecitation() {
   };
 
   const stopListening = () => {
+    keepListeningRef.current = false;
     if (!recognitionRef.current) return;
     recognitionRef.current.stop();
     setIsListening(false);
@@ -505,48 +606,41 @@ export default function NlpRecitation() {
       return;
     }
 
-    const nextTotalMistakes = totalMistakes + comparison.mistakes;
-    const isLastAyah = activeAyahNo >= surah.ayahs.length;
-
-    if (user?.uid) {
-      try {
-        await writeAyahAttempt(user.uid, {
-          surahNo: surah.surah_no,
-          surahNameAr: surah.surah_name_ar,
-          ayahNo: currentAyah.ayah_no_surah,
-          targetAyahText: currentAyah.ayah_ar,
-          recognizedText,
-          mistakes: comparison.mistakes,
-          isLastAyah,
-        });
-      } catch {
-        setError('تمت المتابعة، لكن تعذر تسجيل المحاولة في قاعدة البيانات حالياً.');
-      }
-    }
-
-    setTotalMistakes(nextTotalMistakes);
-
-    if (isLastAyah) {
-      await completeSurahIfQualified(nextTotalMistakes);
-      setError('');
+    if (await completeFromTranscriptIfWholeSurah(recognizedText)) {
       return;
     }
 
-    setActiveAyahNo((prev) => prev + 1);
-    setRecognizedText('');
-    setError('');
+    await advanceAyah(recognizedText, comparison.mistakes);
   };
 
+  useEffect(() => {
+    if (!autoTilawaEnabled || isListening || loading || sessionFinished) return;
+
+    const timer = window.setTimeout(() => {
+      startListening();
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [autoTilawaEnabled, isListening, loading, sessionFinished]);
+
   const resetSession = () => {
+    if (isListening) {
+      stopListening();
+    }
     setActiveAyahNo(1);
     setRecognizedText('');
     setTotalMistakes(0);
     setModelMatches([]);
+    setAutoTilawaEnabled(false);
+    setSessionFinished(false);
+    setNlpHint('');
+    setAyahMistakeDetails([]);
+    setShowMistakeDetails(false);
     transcriptRef.current = '';
     setError('');
   };
 
-  const successState = surah && activeAyahNo >= surah.ayahs.length && recognizedText.trim().length > 0;
+  const successState = Boolean(surah && sessionFinished);
 
   return (
     <div className="bg-surface text-on-surface min-h-screen pb-32 rtl" dir="rtl">
@@ -605,7 +699,7 @@ export default function NlpRecitation() {
 
                 <div className="rounded-2xl border border-outline-variant/15 bg-surface p-4 mb-4">
                   <p className="text-xs text-on-surface-variant mb-2">النص المستهدف (للمقارنة)</p>
-                  <p className="font-quran text-2xl leading-[2.2]">{currentAyah.ayah_ar}</p>
+                  <p className="font-quran text-2xl leading-[2.2]">{isFullSurahTranscript ? comparisonTargetText : currentAyah.ayah_ar}</p>
                 </div>
 
                 {currentAyah.tafsir && (
@@ -692,6 +786,30 @@ export default function NlpRecitation() {
                   </button>
 
                   <button
+                    onClick={() => {
+                      if (autoTilawaEnabled) {
+                        setAutoTilawaEnabled(false);
+                        if (isListening) {
+                          stopListening();
+                        }
+                        setNlpHint('تم إيقاف وضع التلاوة التلقائي.');
+                        return;
+                      }
+
+                      setAutoTilawaEnabled(true);
+                      setSessionFinished(false);
+                      setNlpHint('وضع التلاوة التلقائي مفعل: اقرأ كل آية وسيتم التقدم تلقائياً عبر NLP.');
+                      if (!isListening) {
+                        startListening();
+                      }
+                    }}
+                    className={`inline-flex items-center gap-2 px-5 py-3 rounded-full font-bold active:scale-95 transition-transform ${autoTilawaEnabled ? 'bg-emerald-700 text-white' : 'bg-emerald-100 text-emerald-900 border border-emerald-300'}`}
+                  >
+                    <Mic className="w-4 h-4" />
+                    {autoTilawaEnabled ? 'إيقاف التلاوة التلقائية' : 'ابدأ تلاوة السورة تلقائياً'}
+                  </button>
+
+                  <button
                     onClick={resetSession}
                     className="inline-flex items-center gap-2 px-5 py-3 rounded-full bg-surface-container-low border border-outline-variant/20 font-bold active:scale-95 transition-transform"
                   >
@@ -704,11 +822,50 @@ export default function NlpRecitation() {
                   أخطاء السورة حتى الآن: <span className="font-bold">{arabicNumber(totalMistakes)}</span>
                 </div>
 
+                {nlpHint && (
+                  <div className="mt-3 rounded-xl bg-secondary-container/30 border border-secondary/20 p-3 text-sm text-on-surface">
+                    {nlpHint}
+                  </div>
+                )}
+
                 {successState && (
-                  <div className={`mt-4 rounded-2xl p-4 text-sm ${totalMistakes < 10 ? 'bg-primary/15 text-primary' : 'bg-error/15 text-error'}`}>
+                  <button
+                    type="button"
+                    onClick={() => setShowMistakeDetails((prev) => !prev)}
+                    className={`mt-4 w-full text-right rounded-2xl p-4 text-sm ${totalMistakes < 10 ? 'bg-primary/15 text-primary' : 'bg-error/15 text-error'}`}
+                  >
                     {totalMistakes < 10
                       ? 'أحسنت! أكملت السورة بأقل من 10 أخطاء، وتم تلوينها داخل قلب السور.'
                       : 'تم إكمال السورة، لكن عدد الأخطاء 10 أو أكثر، لذلك لم تُحتسب في القلب بعد.'}
+                    <span className="block mt-2 text-xs opacity-80">اضغط لعرض تفاصيل الأخطاء</span>
+                  </button>
+                )}
+
+                {successState && showMistakeDetails && ayahMistakeDetails.length > 0 && (
+                  <div className="mt-3 rounded-2xl p-4 bg-error/10 border border-error/30 text-sm">
+                    <p className="font-bold text-error mb-3">تفاصيل الأخطاء حسب الآية</p>
+                    <div className="space-y-3">
+                      {ayahMistakeDetails.map((detail) => (
+                        <div key={detail.ayahNo} className="rounded-xl bg-surface p-3 border border-outline-variant/20">
+                          <p className="font-semibold mb-2">الآية {arabicNumber(detail.ayahNo)} - {arabicNumber(detail.mistakes)} أخطاء</p>
+                          {detail.pairs.length > 0 ? (
+                            <div className="space-y-1 text-xs">
+                              {detail.pairs.map((pair, index) => (
+                                <p key={`${detail.ayahNo}-${index}`}>متوقع: <span className="font-semibold">{pair.expected}</span> | سُمِع: <span className="font-semibold text-error">{pair.heard}</span></p>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-xs text-on-surface-variant">تعذّر استخراج كلمات مختلفة لهذه الآية.</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {successState && showMistakeDetails && ayahMistakeDetails.length === 0 && (
+                  <div className="mt-3 rounded-2xl p-4 bg-primary/10 border border-primary/30 text-sm text-primary">
+                    لا توجد أخطاء محفوظة لهذه الجلسة.
                   </div>
                 )}
               </div>
@@ -721,20 +878,16 @@ export default function NlpRecitation() {
                   <h3 className="text-xl font-headline font-bold">قلب السور المكتملة</h3>
                 </div>
                 <p className="text-sm text-on-surface-variant mb-4">
-                  كل سورة تُكملها بأقل من 10 أخطاء يتم تلوينها بالأخضر داخل القلب.
-                </p>
-                <p className="text-xs text-secondary mb-4 bg-secondary-container/30 rounded p-2">
-                  💡 يمكنك النقر على أي سورة في القلب لتلوينها وحفظها في قاعدة البيانات للاختبار.
+                  القلب أصبح في صفحة مستقلة الآن. افتحه من الأسفل أو من الزر التالي، ثم أكمل التلاوة هناك.
                 </p>
 
-                <div className="rounded-2xl p-4 bg-gradient-to-br from-emerald-50 to-white border border-emerald-200/60 overflow-auto">
-                  <div
-                    ref={heartSvgRef}
-                    onClick={handleHeartContainerClick}
-                    dangerouslySetInnerHTML={{ __html: heartSvgMarkup }}
-                    className="w-full min-w-[320px]"
-                  />
-                </div>
+                <button
+                  onClick={() => navigate('/heart')}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-primary text-white text-sm font-bold"
+                >
+                  <Heart className="w-4 h-4" />
+                  فتح صفحة القلب
+                </button>
               </div>
 
               <div className="bg-surface-container-lowest rounded-3xl border border-outline-variant/10 shadow-sm p-6">

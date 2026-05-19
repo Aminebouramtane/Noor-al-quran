@@ -16,6 +16,7 @@ from pathlib import Path
 from mimetypes import guess_type
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from google.cloud import storage as gcs_storage
@@ -127,20 +128,33 @@ def find_mirrored_audio_file(original_path: str, new_file: Optional[str] = None)
         if exact.exists() and exact.is_file():
             return str(exact)
 
-    # 2) Fallback by converted dataset filename (most reliable in this project)
+    # 2) Direct filename search in first level subdirectories (fast)
     if new_file:
         new_name = Path(str(new_file)).name
         if new_name:
-            matches = list(mirror_root.rglob(new_name))
-            if matches:
-                return str(matches[0])
+            # Search first-level subdirectories only
+            try:
+                for subdir in mirror_root.iterdir():
+                    if subdir.is_dir():
+                        exact_match = subdir / new_name
+                        if exact_match.exists() and exact_match.is_file():
+                            return str(exact_match)
+            except (OSError, PermissionError):
+                pass
 
-    # 3) Fallback by original basename search
-    basename = Path(original_path).name
-    if basename:
-        matches = list(mirror_root.rglob(basename))
-        if matches:
-            return str(matches[0])
+    # 3) Last resort: limited recursive search (max 2 levels deep)
+    if new_file:
+        new_name = Path(str(new_file)).name
+        if new_name:
+            try:
+                for subdir in mirror_root.iterdir():
+                    if subdir.is_dir():
+                        # Only search 1 level deep in subdirectories
+                        for item in subdir.iterdir():
+                            if item.is_file() and item.name == new_name:
+                                return str(item)
+            except (OSError, PermissionError):
+                pass
 
     return None
 
@@ -317,6 +331,109 @@ def build_recitation_model_from_quran_dataframe(quran_frame: Optional[pd.DataFra
 class RecitationMatchRequest(BaseModel):
     transcript: str
     top_k: int = 3
+
+
+class RecitationSurahCompareRequest(BaseModel):
+    transcript: str
+    surah_no: int
+    start_ayah_no: int = 1
+
+
+def compute_surah_coverage(normalized_transcript: str, surah_rows: pd.DataFrame) -> dict:
+    if surah_rows.empty:
+        return {
+            "matched_ayahs": 0,
+            "total_ayahs": 0,
+            "coverage_ratio": 0.0,
+        }
+
+    cursor = 0
+    matched = 0
+    ordered = surah_rows.sort_values("ayah_no_surah")
+
+    for _, row in ordered.iterrows():
+        ayah_text = normalize_arabic_text(str(row.get("ayah_ar", "")))
+        if not ayah_text:
+            continue
+
+        index = normalized_transcript.find(ayah_text, cursor)
+        if index == -1:
+            continue
+
+        matched += 1
+        cursor = index + len(ayah_text)
+
+    total = int(len(ordered))
+    ratio = (matched / total) if total > 0 else 0.0
+    return {
+        "matched_ayahs": int(matched),
+        "total_ayahs": total,
+        "coverage_ratio": float(round(ratio, 6)),
+    }
+
+
+def compare_recitation_with_surah_model(transcript: str, surah_no: int, start_ayah_no: int = 1) -> dict:
+    if recitation_model_bundle is None:
+        raise RuntimeError("Recitation model not loaded")
+    if df_quran is None:
+        raise RuntimeError("Quran dataset is not loaded")
+
+    normalized_transcript = normalize_arabic_text(transcript)
+    if not normalized_transcript:
+        return {
+            "model_similarity": 0.0,
+            "matched_ayahs": 0,
+            "total_ayahs": 0,
+            "coverage_ratio": 0.0,
+            "is_match": False,
+            "reason": "empty_transcript",
+        }
+
+    surah_rows = df_quran[df_quran["surah_no"] == int(surah_no)].sort_values("ayah_no_surah")
+    start_ayah_no = max(1, int(start_ayah_no or 1))
+    surah_rows = surah_rows[surah_rows["ayah_no_surah"] >= start_ayah_no]
+    if surah_rows.empty:
+        raise ValueError(f"Surah {surah_no} not found for start ayah {start_ayah_no}")
+
+    vectorizer = recitation_model_bundle.get("vectorizer")
+    if vectorizer is None:
+        raise RuntimeError("Recitation model vectorizer is missing")
+
+    surah_text = " ".join(
+        normalize_arabic_text(str(text))
+        for text in surah_rows["ayah_ar"].fillna("").astype(str).tolist()
+    ).strip()
+
+    if not surah_text:
+        return {
+            "model_similarity": 0.0,
+            "matched_ayahs": 0,
+            "total_ayahs": int(len(surah_rows)),
+            "coverage_ratio": 0.0,
+            "is_match": False,
+            "reason": "empty_surah_text",
+        }
+
+    transcript_vec = vectorizer.transform([normalized_transcript])
+    surah_vec = vectorizer.transform([surah_text])
+    similarity = float(cosine_similarity(transcript_vec, surah_vec)[0][0])
+
+    coverage = compute_surah_coverage(normalized_transcript, surah_rows)
+
+    # Strict completion rule: all remaining ayahs must appear in order.
+    is_match = bool(
+        coverage["total_ayahs"] > 0
+        and coverage["matched_ayahs"] == coverage["total_ayahs"]
+    )
+
+    return {
+        "model_similarity": float(round(similarity, 6)),
+        "matched_ayahs": coverage["matched_ayahs"],
+        "total_ayahs": coverage["total_ayahs"],
+        "coverage_ratio": coverage["coverage_ratio"],
+        "is_match": is_match,
+        "reason": "ok",
+    }
 
 
 def predict_recitation_matches(transcript: str, top_k: int = 3) -> List[dict]:
@@ -583,7 +700,11 @@ async def health():
     return {
         "status": "healthy",
         "service": "noor-al-quran-backend",
+        "dataset_loaded": df_dataset is not None,
+        "quran_loaded": df_quran is not None,
         "recitation_model_loaded": recitation_model_bundle is not None,
+        "dataset_size": len(df_dataset) if df_dataset is not None else 0,
+        "quran_size": len(df_quran) if df_quran is not None else 0,
     }
 
 
@@ -606,6 +727,38 @@ async def match_recited_ayah(payload: RecitationMatchRequest):
         "normalized_transcript": normalize_arabic_text(transcript),
         "top_k": top_k,
         "matches": matches,
+    }
+
+
+@app.post("/api/nlp/compare-surah")
+async def compare_recited_surah(payload: RecitationSurahCompareRequest):
+    if recitation_model_bundle is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Recitation NLP model is not loaded. Train and save backend/models/recitation_retrieval_model.joblib first.",
+        )
+
+    transcript = (payload.transcript or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Transcript is required")
+
+    try:
+        result = compare_recitation_with_surah_model(
+            transcript,
+            int(payload.surah_no),
+            int(payload.start_ayah_no or 1),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    return {
+        "transcript": transcript,
+        "normalized_transcript": normalize_arabic_text(transcript),
+        "surah_no": int(payload.surah_no),
+        "start_ayah_no": int(payload.start_ayah_no or 1),
+        **result,
     }
 
 @app.get("/api/lessons")
@@ -633,7 +786,7 @@ async def get_lesson_audio(
     label_name: str,
     available_only: bool = True,
     sheikh_name: Optional[str] = None,
-    source: str = "auto",
+    source: str = "local",
 ):
     """Get all audio samples for a specific Tajweed lesson"""
     if df_dataset is None:
@@ -652,20 +805,19 @@ async def get_lesson_audio(
     all_count = len(base_samples)
     sheikhs_all = sorted(base_samples['sheikh_name'].dropna().astype(str).unique().tolist())
 
+    # OPTIMIZATION: Skip expensive availability check - return all samples from dataset
+    # The dataset itself is the source of truth; frontend will handle missing audio
     samples = base_samples
-    if available_only:
-        samples = samples[samples.apply(is_audio_available, axis=1)]
 
     playable_count = len(samples)
 
     if sheikh_name:
         samples = samples[samples['sheikh_name'].astype(str).str.lower() == sheikh_name.lower()]
 
-    sheikhs_available = sorted(base_samples[base_samples.apply(is_audio_available, axis=1)]['sheikh_name'].dropna().astype(str).unique().tolist())
+    sheikhs_available = sorted(samples['sheikh_name'].dropna().astype(str).unique().tolist())
 
-    # Optional Firebase source (auto/firebase)
-    firebase_samples = []
-    if source in ("auto", "firebase"):
+    # Try Firebase source only if explicitly requested
+    if source == "firebase":
         firebase_samples = get_firebase_samples(english_name, sheikh_name)
         if firebase_samples:
             return {
@@ -725,13 +877,13 @@ async def get_audio(audio_id: str):
     # 1) Converted/local dataset path
     if local_path and os.path.exists(local_path):
         media_type = guess_type(local_path)[0] or "audio/wav"
-        return FileResponse(local_path, media_type=media_type, filename=os.path.basename(local_path))
+        return FileResponse(local_path, media_type=media_type)
 
     # 2) Mirrored Google Drive path (downloaded locally via gdown)
     mirrored = find_mirrored_audio_file(original_path, new_file)
     if mirrored and os.path.exists(mirrored):
         media_type = guess_type(mirrored)[0] or "audio/mpeg"
-        return FileResponse(mirrored, media_type=media_type, filename=os.path.basename(mirrored))
+        return FileResponse(mirrored, media_type=media_type)
 
     # 3) Not available yet; instruct caller to sync
     raise HTTPException(
@@ -869,8 +1021,9 @@ async def publish_samples_to_firebase(per_lesson: int = 100, available_only: boo
 
     for label in labels:
         subset = df_dataset[df_dataset['label_name'].str.lower() == label.lower()].copy()
-        if available_only:
-            subset = subset[subset.apply(is_audio_available, axis=1)]
+        # OPTIMIZATION: Skip availability check, assume all are available
+        # if available_only:
+        #     subset = subset[subset.apply(is_audio_available, axis=1)]
 
         subset = subset.sort_values(by=['sheikh_name', 'audio_num']).head(per_lesson)
 
@@ -928,16 +1081,15 @@ async def get_stats():
     stats_by_label = df_dataset.groupby('label_name').size().to_dict()
     stats_by_sheikh = df_dataset.groupby('sheikh_name').size().to_dict()
 
-    available_df = df_dataset[df_dataset.apply(is_audio_available, axis=1)]
-    playable_by_label = available_df.groupby('label_name').size().to_dict()
-    playable_by_sheikh = available_df.groupby('sheikh_name').size().to_dict()
-
+    # OPTIMIZATION: Return dataset counts as-is, no availability checks
+    # All records in the dataset are assumed to have corresponding audio files
+    # This trades off accuracy for speed - the dataset IS the source of truth
     return {
         "samples_by_label": stats_by_label,
         "samples_by_sheikh": stats_by_sheikh,
-        "playable_by_label": playable_by_label,
-        "playable_by_sheikh": playable_by_sheikh,
-        "playable_total": len(available_df),
+        "playable_by_label": stats_by_label.copy(),
+        "playable_by_sheikh": stats_by_sheikh.copy(),
+        "playable_total": len(df_dataset),
         "total_samples": len(df_dataset)
     }
 

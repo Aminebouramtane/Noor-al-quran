@@ -1,0 +1,370 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+\usepackage{array}
+\usepackage{longtable}
+\title{Noor Al-Quran App Workflow}\author{Generated Technical Overview}\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+Noor Al-Quran is a Quran learning application with two main ideas:
+\begin{itemize}
+  \item classical learning, where the user reads surahs and lessons from the Quran dataset;
+  \item intelligent recitation support, where speech recognition and an NLP backend try to match the spoken Arabic text against Quran ayahs.
+\end{itemize}
+
+This document explains the application from the first page load to the final recitation result.
+
+\section{System Overview}
+The project is split into two parts:
+\begin{itemize}
+  \item \textbf{Frontend}: a React + Vite application inside \texttt{frontend/}.
+  \item \textbf{Backend}: a FastAPI service inside \texttt{backend/} that serves Quran data, lesson data, audio, and NLP matching endpoints.
+\end{itemize}
+
+The frontend talks to the backend through the helper in \texttt{frontend/src/lib/api.ts}. The backend reads Quran datasets, loads or builds a recitation retrieval model, and exposes JSON endpoints that the UI consumes.
+
+\section{Schemas}
+This section adds quick visual schemas for the app architecture and runtime flow.
+
+\subsection{Global Architecture Schema}
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fbox{\begin{minipage}{0.92\linewidth}
+\centering
+\textbf{User Browser}\\
+\vspace{0.3em}
+$\downarrow$\\
+\vspace{0.3em}
+\textbf{Frontend (React + Vite)}\\
+Routes, Auth Context, NLP Recitation UI\\
+\vspace{0.3em}
+$\downarrow$ HTTP API\\
+\vspace{0.3em}
+\textbf{Backend (FastAPI)}\\
+Quran endpoints, NLP matching, surah comparison\\
+\vspace{0.3em}
+$\downarrow$ data/model/storage\\
+\vspace{0.3em}
+\textbf{Data Layer}\\
+CSV datasets + retrieval model + optional Firebase
+\end{minipage}}
+\end{center}
+
+\subsection{Recitation Session Schema}
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fbox{\begin{minipage}{0.92\linewidth}
+\small
+\textbf{Start} $\rightarrow$ Open \texttt{/nlp-reading} $\rightarrow$ Fetch surah list\\[0.3em]
+$\rightarrow$ Select surah $\rightarrow$ Fetch full ayahs $\rightarrow$ Show target ayah\\[0.3em]
+$\rightarrow$ Start microphone (\texttt{ar-SA}) $\rightarrow$ Build transcript\\[0.3em]
+$\rightarrow$ Local compare (normalize/tokenize/align/count mistakes)\\[0.3em]
+$\rightarrow$ Backend match (\texttt{/api/nlp/match-ayah})\\[0.3em]
+$\rightarrow$ Decision: confirm / auto-advance / give hint\\[0.3em]
+$\rightarrow$ Last ayah? yes $\rightarrow$ finalize + save progress; no $\rightarrow$ next ayah
+\end{minipage}}
+\end{center}
+
+\subsection{NLP Decision Schema}
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fbox{\begin{minipage}{0.92\linewidth}
+\small
+\textbf{Input:} transcript from speech recognition\\[0.2em]
+$\rightarrow$ \textbf{Step 1 (Frontend):} local text heuristics and mismatch highlights\\[0.2em]
+$\rightarrow$ \textbf{Step 2 (Backend):} TF-IDF + nearest-neighbor retrieval\\[0.2em]
+$\rightarrow$ \textbf{Step 3 (Frontend):} inspect top match + confidence\\[0.2em]
+$\rightarrow$ \textbf{Decision:}
+\begin{itemize}
+  \item if surah and confidence are acceptable: accept ayah and move forward;
+  \item if confidence is low or wrong surah: keep ayah and show hint;
+  \item if transcript covers remaining surah: finish full-surah flow.
+\end{itemize}
+\end{minipage}}
+\end{center}
+
+\subsection{AI Model Internals Schema}
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fbox{\begin{minipage}{0.92\linewidth}
+\small
+\textbf{Offline preparation (server startup)}\\[0.2em]
+Quran ayah text $\rightarrow$ Arabic normalization $\rightarrow$ TF-IDF vectorizer fit\\[0.2em]
+$\rightarrow$ ayah vectors + metadata index (surah, ayah number, original text)\\[0.4em]
+
+\textbf{Online inference (each transcript)}\\[0.2em]
+Transcript $\rightarrow$ normalization $\rightarrow$ transform with same TF-IDF model\\[0.2em]
+$\rightarrow$ nearest-neighbor search in ayah vector space\\[0.2em]
+$\rightarrow$ top-$k$ candidates + similarity/confidence scores\\[0.2em]
+$\rightarrow$ frontend decision (accept, hint, or keep current ayah)
+\end{minipage}}
+\end{center}
+
+\section{Start From Zero}
+When the app starts, the flow is roughly:
+\begin{enumerate}
+  \item The browser loads the React entry point in \texttt{frontend/src/main.tsx}.
+  \item React renders \texttt{App} inside the root element.
+  \item \texttt{App.tsx} creates the router and wraps the app with the authentication provider.
+  \item The app lands on the splash or onboarding flow, then moves to login or signup if the user is not authenticated.
+  \item After authentication, protected pages such as Home, Reading, Lessons, Profile, Stats, and the NLP recitation page become available.
+\end{enumerate}
+
+\section{Frontend Entry Flow}
+The entry file is very small because its job is only to mount the app:
+\begin{itemize}
+  \item \texttt{createRoot(...).render(<App />)} mounts the application.
+  \item \texttt{App.tsx} defines all routes.
+  \item \texttt{AuthProvider} makes the logged-in user available everywhere.
+  \item \texttt{NotificationManager} keeps notifications available globally.
+\end{itemize}
+
+The route structure matters because the recitation page is not a standalone page; it is one part of a larger Quran learning journey.
+
+\section{Navigation and Protection}
+Most learning pages are wrapped with \texttt{ProtectedRoute}. That means:
+\begin{itemize}
+  \item unauthenticated users are redirected away from private content;
+  \item authenticated users can access reading, lessons, recitation, profile, and stats pages;
+  \item the app keeps user progress and recitation attempts tied to an account when Firebase is enabled.
+\end{itemize}
+
+\section{Where the NLP Recitation Page Fits}
+The page at \texttt{frontend/src/pages/NlpRecitation.tsx} is the center of the intelligent recitation feature. It is reachable at:
+\begin{itemize}
+  \item \texttt{/nlp-reading}
+  \item \texttt{/nlp-reading/:surahNo}
+\end{itemize}
+
+That page lets the user:
+\begin{itemize}
+  \item pick a surah;
+  \item open the microphone;
+  \item speak Arabic recitation aloud;
+  \item see the recognized transcript on screen;
+  \item compare the spoken text with the expected ayah text;
+  \item optionally enable auto-tilawa, which advances by NLP signals;
+  \item save attempt history and surah completion data.
+\end{itemize}
+
+\section{User Journey Inside the Recitation Page}
+Once the page opens, the following sequence happens.
+
+\subsection{1. Load Surah List}
+The page first requests the list of surahs from the backend through \texttt{api.getQuranSurahs()}. The response contains summary data such as:
+\begin{itemize}
+  \item surah number;
+  \item Arabic, English, and romanized names;
+  \item total ayah count;
+  \item place of revelation;
+  \item whether the surah has sajdah ayahs.
+\end{itemize}
+
+If the user came from a URL like \texttt{/nlp-reading/2}, that surah is selected automatically. Otherwise, the first available surah is selected.
+
+\subsection{2. Load Full Surah Data}
+After a surah is selected, the page requests full surah details with \texttt{api.getQuranSurah(surahNo)}. That response includes every ayah in order, plus optional tafsir and metadata.
+
+The page resets the session state at this point:
+\begin{itemize}
+  \item current ayah goes back to 1;
+  \item recognized text is cleared;
+  \item mistake counters are reset;
+  \item completion flags are cleared;
+  \item any old NLP hints and mistake details are removed.
+\end{itemize}
+
+\subsection{3. Show the Target Text}
+The UI displays the current ayah in Arabic script. If the current transcript contains the remaining part of the surah, the page can switch from single-ayah comparison to full-surah comparison.
+
+That behavior is driven by the local helper that checks whether the spoken transcript contains the rest of the surah in order.
+
+\subsection{4. Start Speech Recognition}
+When the user presses the microphone button, the browser Speech Recognition API is opened in Arabic mode \texttt{ar-SA}. The page listens continuously and keeps interim results.
+
+As speech arrives:
+\begin{itemize}
+  \item the transcript is assembled from recognition events;
+  \item the text is stored in local state;
+  \item the screen updates in real time.
+\end{itemize}
+
+If the browser does not support speech recognition, the page shows an error and suggests a compatible browser.
+
+\subsection{5. Analyze the Spoken Transcript}
+When recognition stops, the page sends the final transcript to the backend NLP endpoint through \texttt{api.matchRecitedAyah(transcript, 3)}.
+
+The backend returns the closest matching ayahs with confidence scores. The page uses those matches to:
+\begin{itemize}
+  \item show likely ayahs in the NLP analysis panel;
+  \item decide whether the recitation is close enough to advance;
+  \item provide hint text when the model is unsure, the wrong surah is detected, or the confidence is too low.
+\end{itemize}
+
+\subsection{6. Compare Spoken Words to Target Words}
+The page also performs local text comparison in the browser:
+\begin{itemize}
+  \item Arabic diacritics are removed;
+  \item punctuation is normalized;
+  \item words are tokenized;
+  \item the target text and spoken text are aligned;
+  \item correct words and mistaken words are highlighted;
+  \item an approximate mistake count is computed.
+\end{itemize}
+
+This gives immediate feedback even before the backend model is consulted.
+
+\subsection{7. Confirm Ayah or Advance Automatically}
+There are two ways the page advances:
+\begin{itemize}
+  \item \textbf{Manual confirmation}: the user presses the confirm button after reciting an ayah.
+  \item \textbf{Auto-tilawa}: the app watches the speech recognition transcript and uses NLP to move to the next ayah when the current ayah is judged complete.
+\end{itemize}
+
+If the transcript already contains the rest of the surah, the app can finish the full-surah flow immediately instead of advancing ayah by ayah.
+
+\section{NLP Decision Flow}
+The intelligent part of the app is a combination of local heuristics and backend matching.
+
+\subsection{Local Heuristics}
+The frontend has helpers to:
+\begin{itemize}
+  \item normalize Arabic characters;
+  \item tokenize Arabic words;
+  \item align spoken words with expected words;
+  \item count mistakes;
+  \item extract sample mismatch pairs for display.
+\end{itemize}
+
+This helps the user see exactly where the spoken text diverges from the target ayah.
+
+\subsection{Backend Matching}
+The backend endpoint \texttt{/api/nlp/match-ayah} receives a transcript and returns top matching ayahs. The matching model is built from Quran text using text vectorization and nearest-neighbor search.
+
+The page uses the highest-ranked match to determine whether:
+\begin{itemize}
+  \item the model recognized the correct surah;
+  \item the confidence is high enough;
+  \item the user moved backwards or ahead in the surah;
+  \item the current ayah should be accepted and counted.
+\end{itemize}
+
+\section{Backend Workflow}
+The backend in \texttt{backend/main.py} is responsible for data and AI services.
+
+\subsection{Data Loading}
+At startup it tries to load:
+\begin{itemize}
+  \item the Quran dataset;
+  \item the tafsir dataset;
+  \item the recitation retrieval model from disk;
+  \item Firebase credentials and storage configuration if available.
+\end{itemize}
+
+If the saved recitation model is not available, the backend can build one in memory from the Quran dataframe.
+
+\subsection{Main Endpoints Used by the Recitation Page}
+The NLP page relies on these endpoints:
+\begin{itemize}
+  \item \texttt{GET /api/quran/surahs} to fetch the surah list;
+  \item \texttt{GET /api/quran/surah/\{surahNo\}} to fetch one surah with all ayahs;
+  \item \texttt{POST /api/nlp/match-ayah} to find the closest ayah to a transcript;
+  \item \texttt{POST /api/nlp/compare-surah} to verify whether a transcript covers the remaining part of a surah.
+\end{itemize}
+
+\subsection{How the Matching Model Works}
+The backend normalizes Arabic text and converts each ayah into a character-level feature space using TF-IDF. Then it uses nearest-neighbor search to retrieve the closest Quran ayahs to the transcript.
+
+This setup is suitable because recitation text is short, Arabic spelling variations are common, and diacritics are often missing in speech transcripts.
+
+\subsection{AI Model Step-by-Step (IA Engine)}
+The IA engine used in this app is a retrieval model, not a generative model. It does not create new text; it finds the closest existing ayahs.
+
+\begin{enumerate}
+  \item \textbf{Build reference corpus}: every ayah is loaded from the Quran dataset with its surah and ayah identifiers.
+  \item \textbf{Normalize Arabic}: diacritics and text variants are normalized to reduce spelling/noise differences between recitation transcript and Quran text.
+  \item \textbf{Vectorize with TF-IDF}: each ayah is converted into a numeric vector using character-level TF-IDF so partial and noisy matches are still detectable.
+  \item \textbf{Index vectors}: all ayah vectors are stored in a nearest-neighbor index for fast lookup.
+  \item \textbf{Transform transcript}: each recognized speech transcript is normalized and transformed with the same fitted vectorizer.
+  \item \textbf{Retrieve top matches}: nearest-neighbor search returns top-$k$ candidate ayahs with similarity/confidence values.
+  \item \textbf{Apply decision rules}: the frontend checks candidate surah, ayah position, and confidence thresholds to decide whether to advance, warn, or ask the user to retry.
+\end{enumerate}
+
+In short, the model computes similarity in vector space: the closer the transcript vector is to an ayah vector, the higher the confidence for that ayah.
+
+\section{Persistence and Progress Tracking}
+The recitation page stores progress in two places.
+
+\subsection{Local Browser Storage}
+Completed surahs that qualify for the "heart" view are stored in browser local storage. A custom event keeps the UI in sync when the stored completion list changes.
+
+This allows the app to remember completed surahs even before remote sync happens.
+
+\subsection{Firebase}
+If Firebase is configured, the app also writes user progress remotely:
+\begin{itemize}
+  \item each ayah attempt is saved under \texttt{users/\{uid\}/ayahAttempts};
+  \item each completed surah is saved under \texttt{users/\{uid\}/surahCompletions}.
+\end{itemize}
+
+That means the app can preserve recitation history and completion summaries across sessions and devices.
+
+\section{End-of-Session Behavior}
+A session ends when the user reaches the last ayah or finishes a full-surah transcript.
+
+At the end, the page:
+\begin{itemize}
+  \item records the final mistake count;
+  \item marks the session as finished;
+  \item stops auto-tilawa if it was enabled;
+  \item computes whether the surah qualifies for the heart view;
+  \item optionally shows a detailed mistake breakdown by ayah.
+\end{itemize}
+
+If the final mistake count is under 10, the surah is added to the list of completed surahs shown in the heart section. If the count is 10 or more, the surah is still considered completed for the session, but it is not colored as a successful completion.
+
+\section{Other Pages in the App}
+Although the NLP recitation page is the most complex part, the rest of the app supports the learning journey:
+\begin{itemize}
+  \item \textbf{Splash / Onboarding} introduces the app.
+  \item \textbf{Login / Signup} handles authentication.
+  \item \textbf{Home} acts as the dashboard.
+  \item \textbf{Reading} shows Quran reading content.
+  \item \textbf{Lessons} and \textbf{LessonDetail} support Tajweed lessons.
+  \item \textbf{HeartPage} shows completed surahs.
+  \item \textbf{Profile, Stats, Settings, Help} provide user support and configuration.
+\end{itemize}
+
+\section{End-to-End Summary}
+The full flow of the application is:
+\begin{enumerate}
+  \item the user opens the app in the browser;
+  \item React boots the frontend and loads authentication-aware routes;
+  \item the user signs in and reaches the learning pages;
+  \item the recitation page fetches surah metadata and full ayah text from the backend;
+  \item the user reads aloud into the microphone;
+  \item the browser converts speech to text;
+  \item the frontend compares the transcript locally and sends it to the backend NLP service;
+  \item the backend returns the best ayah matches or surah coverage result;
+  \item the page advances, counts mistakes, stores progress, and updates completion state;
+  \item when the surah is complete, the app records the result in local storage and, if available, in Firebase.
+\end{enumerate}
+
+\section{Files To Read First}
+If someone wants to inspect the implementation directly, the most important files are:
+\begin{itemize}
+  \item \texttt{frontend/src/main.tsx}
+  \item \texttt{frontend/src/App.tsx}
+  \item \texttt{frontend/src/pages/NlpRecitation.tsx}
+  \item \texttt{frontend/src/lib/api.ts}
+  \item \texttt{frontend/src/lib/firebaseCollections.ts}
+  \item \texttt{backend/main.py}
+\end{itemize}
+
+\end{document}

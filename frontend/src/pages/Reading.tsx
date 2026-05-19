@@ -5,6 +5,8 @@ import { motion } from 'motion/react';
 import Header from '../components/Header';
 import BottomNav from '../components/BottomNav';
 import { api } from '../lib/api';
+import { useAuth } from '../contexts/AuthContext';
+import { saveLastReading } from '../lib/readingProgress';
 
 type SurahSummary = {
   surah_no: number;
@@ -37,6 +39,7 @@ type QuranSurah = {
 const arabicNumber = (value: number) => new Intl.NumberFormat('ar-EG').format(value);
 
 export default function Reading() {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const { surahNo } = useParams<{ surahNo?: string }>();
   const [surahs, setSurahs] = useState<SurahSummary[]>([]);
@@ -91,15 +94,12 @@ export default function Reading() {
 
   useEffect(() => {
     if (!surah || !currentSurahNo) return;
-    localStorage.setItem(
-      'noor:lastReading',
-      JSON.stringify({
-        surahNo: surah.surah_no,
-        surahNameAr: surah.surah_name_ar,
-        ayahNo: activeAyah,
-      })
-    );
-  }, [activeAyah, currentSurahNo, surah]);
+    saveLastReading(user?.uid, {
+      surahNo: surah.surah_no,
+      surahNameAr: surah.surah_name_ar,
+      ayahNo: activeAyah,
+    });
+  }, [activeAyah, currentSurahNo, surah, user?.uid]);
 
   const jumpToAyah = (ayahNumber: number) => {
     if (!surah) return;

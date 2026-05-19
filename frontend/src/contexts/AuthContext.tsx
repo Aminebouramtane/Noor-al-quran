@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User, GoogleAuthProvider, createUserWithEmailAndPassword, signInWithEmailAndPassword, signInWithPopup, signOut, onAuthStateChanged, updateProfile } from 'firebase/auth';
 import { auth, firebaseConfigError } from '../lib/firebase';
 import { upsertUserProfile } from '../lib/firebaseCollections';
+import { clearReadingProgressStorage } from '../lib/readingProgress';
 
 interface AuthContextType {
   user: User | null;
@@ -39,6 +40,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!auth) {
       throw new Error(firebaseConfigError || 'Firebase is not configured correctly');
     }
+    // Clear any old user data from localStorage before creating new account
+    clearReadingProgressStorage();
+    
     setLoading(true);
     try {
       const credential = await createUserWithEmailAndPassword(auth, email, password);
@@ -79,6 +83,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!auth) {
       throw new Error(firebaseConfigError || 'Firebase is not configured correctly');
     }
+    // Clear user data from localStorage on logout
+    clearReadingProgressStorage();
+    
     setLoading(true);
     try {
       await signOut(auth);

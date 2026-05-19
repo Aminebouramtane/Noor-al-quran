@@ -6,6 +6,7 @@ import Header from '../components/Header';
 import BottomNav from '../components/BottomNav';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../lib/api';
+import { loadLastReading } from '../lib/readingProgress';
 
 const ENGLISH_TO_ARABIC: Record<string, string> = {
   Ikhfa: 'أحكام النون الساكنة',
@@ -120,15 +121,7 @@ export default function Home() {
           }))
         );
 
-        const storedReadingRaw = localStorage.getItem('noor:lastReading');
-        let storedReading: LastReading | null = null;
-        if (storedReadingRaw) {
-          try {
-            storedReading = JSON.parse(storedReadingRaw) as LastReading;
-          } catch {
-            storedReading = null;
-          }
-        }
+        const storedReading = loadLastReading(user?.uid);
 
         const fallbackSurah =
           surahData.surahs?.[
@@ -174,7 +167,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [user?.uid]);
 
   const totalSamples = stats?.total_samples ?? 0;
   const playableTotal = stats?.playable_total ?? 0;

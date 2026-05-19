@@ -1,5 +1,5 @@
 import React from 'react';
-import { Home, School, BookOpen, BarChart2, User, Mic } from 'lucide-react';
+import { Home, School, BookOpen, BarChart2, User, Heart } from 'lucide-react';
 import { cn } from '@/src/lib/utils';
 import { useLocation, useNavigate } from 'react-router-dom';
 
@@ -7,7 +7,7 @@ const navItems = [
   { id: 'home', label: 'الرئيسية', icon: Home, path: '/home' },
   { id: 'lessons', label: 'التجويد', icon: School, path: '/lessons' },
   { id: 'quran', label: 'المصحف', icon: BookOpen, path: '/reading' },
-  { id: 'nlp', label: 'التلاوة', icon: Mic, path: '/nlp-reading' },
+  { id: 'heart', label: 'القلب', icon: Heart, path: '/heart' },
   { id: 'stats', label: 'الإحصائيات', icon: BarChart2, path: '/stats' },
   { id: 'profile', label: 'حسابي', icon: User, path: '/profile' },
 ];

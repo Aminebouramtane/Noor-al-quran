@@ -21,7 +21,7 @@ interface AudioPlayerProps {
 
 // Convert Google Drive path to a usable audio URL
 function getAudioUrlFromSample(sample: AudioSample): string {
-  const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+  const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
 
   if (sample.firebase_url) {
     return sample.firebase_url;
@@ -56,11 +56,18 @@ export default function AudioPlayer({ audioUrl, audioSample, title, sheikh, audi
   }, [audioSample, audioUrl]);
 
   useEffect(() => {
+    setError('');
+    setIsPlaying(false);
+    setCurrentTime(0);
+  }, [finalAudioUrl]);
+
+  useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     const updateTime = () => setCurrentTime(audio.currentTime);
     const updateDuration = () => setDuration(audio.duration);
+    const handleCanPlay = () => setError('');
     const handleEnded = () => setIsPlaying(false);
     const handleError = () => {
       setError('خطأ في تحميل الملف الصوتي');
@@ -69,25 +76,34 @@ export default function AudioPlayer({ audioUrl, audioSample, title, sheikh, audi
 
     audio.addEventListener('timeupdate', updateTime);
     audio.addEventListener('loadedmetadata', updateDuration);
+    audio.addEventListener('canplay', handleCanPlay);
     audio.addEventListener('ended', handleEnded);
     audio.addEventListener('error', handleError);
 
     return () => {
       audio.removeEventListener('timeupdate', updateTime);
       audio.removeEventListener('loadedmetadata', updateDuration);
+      audio.removeEventListener('canplay', handleCanPlay);
       audio.removeEventListener('ended', handleEnded);
       audio.removeEventListener('error', handleError);
     };
   }, []);
 
-  const togglePlay = () => {
+  const togglePlay = async () => {
     if (audioRef.current) {
       if (isPlaying) {
         audioRef.current.pause();
+        setIsPlaying(false);
       } else {
-        audioRef.current.play();
+        try {
+          await audioRef.current.play();
+          setError('');
+          setIsPlaying(true);
+        } catch {
+          setError('خطأ في تحميل الملف الصوتي');
+          setIsPlaying(false);
+        }
       }
-      setIsPlaying(!isPlaying);
     }
   };
 
@@ -116,7 +132,7 @@ export default function AudioPlayer({ audioUrl, audioSample, title, sheikh, audi
 
   return (
     <div className="bg-surface-container-lowest rounded-2xl p-6 border border-outline-variant/20 shadow-sm">
-      <audio ref={audioRef} src={finalAudioUrl} crossOrigin="anonymous" />
+      <audio ref={audioRef} src={finalAudioUrl} />
 
       {title && (
         <div className="mb-4">

@@ -6,6 +6,7 @@ const pageTitles: Record<string, string> = {
   '/home': 'الرئيسية',
   '/lessons': 'دروس التجويد',
   '/reading': 'المصحف',
+  '/heart': 'قلب السور',
   '/stats': 'الإحصائيات',
   '/profile': 'حسابي',
   '/settings/notifications': 'الإشعارات',
